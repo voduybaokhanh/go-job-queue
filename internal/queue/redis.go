@@ -11,6 +11,8 @@ import (
 const (
 	// DefaultQueueKey is the default Redis key for the job queue list
 	DefaultQueueKey = "jobqueue:jobs"
+	// DelayedQueueKey is the Redis key for the delayed job queue (sorted set)
+	DelayedQueueKey = "jobqueue:delayed"
 	// LockKeyPrefix is the prefix for lock keys
 	LockKeyPrefix = "jobqueue:lock:"
 )
@@ -97,5 +99,95 @@ func (q *RedisQueue) AcquireLock(ctx context.Context, jobID string, ttl time.Dur
 	}
 
 	return ok, nil
+}
+
+// ReleaseLock releases a distributed lock for a job using Lua script for atomicity
+// The Lua script ensures only the lock owner can release it
+func (q *RedisQueue) ReleaseLock(ctx context.Context, jobID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	lockKey := fmt.Sprintf("%s%s", LockKeyPrefix, jobID)
+
+	// Lua script to atomically delete the lock key
+	// This ensures atomicity even if multiple operations are attempted
+	script := `
+		if redis.call("EXISTS", KEYS[1]) == 1 then
+			return redis.call("DEL", KEYS[1])
+		else
+			return 0
+		end
+	`
+
+	_, err := q.client.Eval(ctx, script, []string{lockKey}).Result()
+	if err != nil {
+		return fmt.Errorf("failed to release lock for job %s: %w", jobID, err)
+	}
+
+	return nil
+}
+
+// EnqueueDelayed adds a job ID to the delayed queue using Redis Sorted Set
+// The score is the timestamp when the job should be enqueued
+func (q *RedisQueue) EnqueueDelayed(ctx context.Context, jobID string, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Calculate the timestamp when the job should be enqueued
+	enqueueAt := time.Now().Add(delay).Unix()
+
+	// Add to sorted set with score = timestamp
+	err := q.client.ZAdd(ctx, DelayedQueueKey, redis.Z{
+		Score:  float64(enqueueAt),
+		Member: jobID,
+	}).Err()
+	if err != nil {
+		return fmt.Errorf("failed to enqueue delayed job %s: %w", jobID, err)
+	}
+
+	return nil
+}
+
+// ProcessDelayedQueue moves ready jobs from delayed queue to main queue
+// Uses ZRANGEBYSCORE to get jobs with score <= current timestamp
+func (q *RedisQueue) ProcessDelayedQueue(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	currentTime := time.Now().Unix()
+
+	// Get jobs that are ready to be enqueued (score <= current timestamp)
+	// Limit to 100 jobs per call to avoid blocking
+	jobs, err := q.client.ZRangeByScore(ctx, DelayedQueueKey, &redis.ZRangeBy{
+		Min:   "0",
+		Max:   fmt.Sprintf("%d", currentTime),
+		Count: 100,
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get delayed jobs: %w", err)
+	}
+
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	// Move jobs to main queue and remove from delayed queue atomically using pipeline
+	pipe := q.client.Pipeline()
+	for _, jobID := range jobs {
+		// Add to main queue
+		pipe.LPush(ctx, q.queueKey, jobID)
+		// Remove from delayed queue
+		pipe.ZRem(ctx, DelayedQueueKey, jobID)
+	}
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to move delayed jobs to main queue: %w", err)
+	}
+
+	return nil
 }
 

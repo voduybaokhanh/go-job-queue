@@ -20,5 +20,12 @@ type Storage interface {
 
 	// IncrementRetryCount increments the retry count for a job
 	IncrementRetryCount(ctx context.Context, jobID uuid.UUID) error
-}
 
+	// UpdateStatusAtomic atomically updates status only if current status matches
+	// Returns true if the update was successful (status matched and was updated), false if status didn't match
+	UpdateStatusAtomic(ctx context.Context, jobID uuid.UUID, fromStatus, toStatus job.Status) (bool, error)
+
+	// GetJobByIdempotencyKey retrieves a job by its idempotency key
+	// Returns nil if no job is found with the given key
+	GetJobByIdempotencyKey(ctx context.Context, idempotencyKey string) (*job.Job, error)
+}
