@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/voduybaokhanh/go-job-queue/internal/lock"
 	"github.com/voduybaokhanh/go-job-queue/internal/queue"
 	"github.com/voduybaokhanh/go-job-queue/internal/scheduler"
 	"github.com/voduybaokhanh/go-job-queue/internal/storage"
@@ -25,6 +26,10 @@ const (
 	dbConnectTimeout = 10 * time.Second
 	// Graceful shutdown timeout
 	shutdownTimeout = 30 * time.Second
+	// Default lock TTL
+	defaultLockTTL = 5 * time.Minute
+	// Default job timeout
+	defaultJobTimeout = 5 * time.Minute
 )
 
 func main() {
@@ -55,16 +60,48 @@ func main() {
 	// Create queue
 	queue := queue.NewRedisQueue(redisClient)
 
+	// Create lock (separate from queue)
+	lock := lock.NewRedisLock(redisClient)
+
 	// Create job handler (using default handler - can be replaced with custom handlers)
 	handler := worker.NewDefaultHandler()
 
+	// Get configuration from environment variables
+	numWorkers := defaultNumWorkers
+	if envWorkers := os.Getenv("NUM_WORKERS"); envWorkers != "" {
+		if parsed, err := fmt.Sscanf(envWorkers, "%d", &numWorkers); err != nil || parsed != 1 {
+			logger.Warn("Invalid NUM_WORKERS, using default", "value", envWorkers, "default", defaultNumWorkers)
+			numWorkers = defaultNumWorkers
+		}
+	}
+
+	lockTTL := defaultLockTTL
+	if envLockTTL := os.Getenv("LOCK_TTL"); envLockTTL != "" {
+		if parsed, err := time.ParseDuration(envLockTTL); err == nil {
+			lockTTL = parsed
+		} else {
+			logger.Warn("Invalid LOCK_TTL, using default", "value", envLockTTL, "default", defaultLockTTL)
+		}
+	}
+
+	jobTimeout := defaultJobTimeout
+	if envJobTimeout := os.Getenv("JOB_TIMEOUT"); envJobTimeout != "" {
+		if parsed, err := time.ParseDuration(envJobTimeout); err == nil {
+			jobTimeout = parsed
+		} else {
+			logger.Warn("Invalid JOB_TIMEOUT, using default", "value", envJobTimeout, "default", defaultJobTimeout)
+		}
+	}
+
 	// Create worker pool
 	pool := worker.NewPool(worker.Config{
-		NumWorkers: defaultNumWorkers,
+		NumWorkers: numWorkers,
 		Queue:      queue,
 		Storage:    storage,
 		Handler:    handler,
-		LockTTL:    5 * time.Minute,
+		Lock:       lock,
+		LockTTL:    lockTTL,
+		JobTimeout: jobTimeout,
 		Logger:     logger,
 	})
 

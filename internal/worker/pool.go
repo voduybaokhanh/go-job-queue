@@ -9,7 +9,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/voduybaokhanh/go-job-queue/internal/job"
+	"github.com/voduybaokhanh/go-job-queue/internal/lock"
 	"github.com/voduybaokhanh/go-job-queue/internal/queue"
+	"github.com/voduybaokhanh/go-job-queue/internal/retry"
 	"github.com/voduybaokhanh/go-job-queue/internal/storage"
 )
 
@@ -25,11 +27,13 @@ type Pool struct {
 	queue        queue.Queue
 	storage      storage.Storage
 	handler      JobHandler
+	lock         lock.Lock
 	jobChan      chan string
 	wg           sync.WaitGroup
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lockTTL      time.Duration
+	jobTimeout   time.Duration
 	logger       *slog.Logger
 }
 
@@ -39,7 +43,9 @@ type Config struct {
 	Queue      queue.Queue
 	Storage    storage.Storage
 	Handler    JobHandler
+	Lock       lock.Lock
 	LockTTL    time.Duration
+	JobTimeout time.Duration
 	Logger     *slog.Logger
 }
 
@@ -50,6 +56,9 @@ func NewPool(cfg Config) *Pool {
 	}
 	if cfg.LockTTL == 0 {
 		cfg.LockTTL = 5 * time.Minute
+	}
+	if cfg.JobTimeout == 0 {
+		cfg.JobTimeout = 5 * time.Minute
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -62,10 +71,12 @@ func NewPool(cfg Config) *Pool {
 		queue:      cfg.Queue,
 		storage:    cfg.Storage,
 		handler:    cfg.Handler,
+		lock:       cfg.Lock,
 		jobChan:    make(chan string, cfg.NumWorkers*2), // Buffered channel
 		ctx:        ctx,
 		cancel:     cancel,
 		lockTTL:    cfg.LockTTL,
+		jobTimeout: cfg.JobTimeout,
 		logger:     cfg.Logger,
 	}
 }
@@ -195,7 +206,15 @@ func (p *Pool) worker(id int) {
 	}
 }
 
-// processJob handles a single job
+// processJob handles a single job following the strict flow:
+// 1. Pull job_id (already done by dispatcher)
+// 2. Acquire lock (Redis, TTL)
+// 3. Load job (DB)
+// 4. Idempotency check
+// 5. Mark PROCESSING (atomic)
+// 6. Execute handler (with timeout)
+// 7. DONE / RETRY / FAILED
+// 8. Release lock
 func (p *Pool) processJob(jobIDStr string) {
 	// Parse job ID
 	jobID, err := uuid.Parse(jobIDStr)
@@ -204,7 +223,7 @@ func (p *Pool) processJob(jobIDStr string) {
 		return
 	}
 
-	// Load job from storage first to check status and idempotency
+	// Step 1: Load job from storage first to check status
 	j, err := p.storage.GetJob(p.ctx, jobID)
 	if err != nil {
 		p.logger.Error("Error getting job from storage", "job_id", jobIDStr, "error", err)
@@ -217,8 +236,8 @@ func (p *Pool) processJob(jobIDStr string) {
 		return
 	}
 
-	// Try to acquire lock - if failed, another worker is processing this job
-	acquired, err := p.queue.AcquireLock(p.ctx, jobIDStr, p.lockTTL)
+	// Step 2: Acquire lock - if failed, another worker is processing this job
+	lockOwnerID, acquired, err := p.lock.AcquireLock(p.ctx, jobIDStr, p.lockTTL)
 	if err != nil {
 		p.logger.Error("Error acquiring lock for job", "job_id", jobIDStr, "error", err)
 		return
@@ -229,65 +248,83 @@ func (p *Pool) processJob(jobIDStr string) {
 		return
 	}
 
-	// Reload job to get latest state after acquiring lock
+	// Ensure lock is released after processing (success or failure)
+	defer func() {
+		if releaseErr := p.lock.ReleaseLock(p.ctx, jobIDStr, lockOwnerID); releaseErr != nil {
+			p.logger.Error("Error releasing lock", "job_id", jobIDStr, "owner_id", lockOwnerID, "error", releaseErr)
+		}
+	}()
+
+	// Step 3: Reload job to get latest state after acquiring lock
 	j, err = p.storage.GetJob(p.ctx, jobID)
 	if err != nil {
 		p.logger.Error("Error reloading job from storage", "job_id", jobIDStr, "error", err)
-		// Release lock on error
-		if releaseErr := p.queue.ReleaseLock(p.ctx, jobIDStr); releaseErr != nil {
-			p.logger.Error("Error releasing lock", "job_id", jobIDStr, "error", releaseErr)
-		}
 		return
 	}
 
 	// Double-check status after acquiring lock (race condition protection)
 	if j.Status == job.StatusDone {
 		p.logger.Info("Job already done after lock acquisition, skipping", "job_id", jobIDStr)
-		// Release lock before returning
-		if releaseErr := p.queue.ReleaseLock(p.ctx, jobIDStr); releaseErr != nil {
-			p.logger.Error("Error releasing lock", "job_id", jobIDStr, "error", releaseErr)
-		}
 		return
 	}
 
-	// Atomically update status from Pending to Processing
+	// Step 4: Idempotency check - check if job with same idempotency_key already exists and is DONE
+	if j.IdempotencyKey != "" {
+		existingJob, err := p.storage.GetJobByIdempotencyKey(p.ctx, j.IdempotencyKey)
+		if err != nil {
+			p.logger.Error("Error checking idempotency key", "job_id", jobIDStr, "idempotency_key", j.IdempotencyKey, "error", err)
+			// Continue processing if check fails (fail open)
+		} else if existingJob != nil && existingJob.ID != jobID && existingJob.Status == job.StatusDone {
+			// Another job with same idempotency key already completed successfully
+			p.logger.Info("Job with same idempotency key already done, marking as duplicate",
+				"job_id", jobIDStr,
+				"idempotency_key", j.IdempotencyKey,
+				"existing_job_id", existingJob.ID.String())
+			
+			// Mark current job as DONE (duplicate) - atomic update
+			updated, updateErr := p.storage.UpdateStatusAtomic(p.ctx, jobID, job.StatusPending, job.StatusDone)
+			if updateErr != nil {
+				p.logger.Error("Error marking duplicate job as Done", "job_id", jobIDStr, "error", updateErr)
+			} else if !updated {
+				// Try updating from any status to Done
+				if updateErr := p.storage.UpdateStatus(p.ctx, jobID, job.StatusDone); updateErr != nil {
+					p.logger.Error("Error updating duplicate job status to Done", "job_id", jobIDStr, "error", updateErr)
+				}
+			}
+			return
+		}
+	}
+
+	// Step 5: Atomically update status from Pending to Processing
 	updated, err := p.storage.UpdateStatusAtomic(p.ctx, jobID, job.StatusPending, job.StatusProcessing)
 	if err != nil {
 		p.logger.Error("Error atomically updating job status to Processing", "job_id", jobIDStr, "error", err)
-		// Release lock on error
-		if releaseErr := p.queue.ReleaseLock(p.ctx, jobIDStr); releaseErr != nil {
-			p.logger.Error("Error releasing lock", "job_id", jobIDStr, "error", releaseErr)
-		}
 		return
 	}
 	if !updated {
 		// Status didn't match (another worker might have processed it)
 		p.logger.Info("Job status update failed, status mismatch", "job_id", jobIDStr)
-		// Release lock before returning
-		if releaseErr := p.queue.ReleaseLock(p.ctx, jobIDStr); releaseErr != nil {
-			p.logger.Error("Error releasing lock", "job_id", jobIDStr, "error", releaseErr)
-		}
 		return
 	}
 
-	// Ensure lock is released after processing (success or failure)
-	defer func() {
-		if releaseErr := p.queue.ReleaseLock(p.ctx, jobIDStr); releaseErr != nil {
-			p.logger.Error("Error releasing lock", "job_id", jobIDStr, "error", releaseErr)
-		}
-	}()
+	p.logger.Info("Processing job", "job_id", jobIDStr, "type", j.Type, "lock_owner", lockOwnerID)
 
-	p.logger.Info("Processing job", "job_id", jobIDStr, "type", j.Type)
+	// Step 6: Execute handler with per-job timeout
+	jobCtx, jobCancel := context.WithTimeout(p.ctx, p.jobTimeout)
+	defer jobCancel()
 
-	// Process the job using handler
-	err = p.handler.ProcessJob(p.ctx, j)
+	err = p.handler.ProcessJob(jobCtx, j)
 	if err != nil {
-		p.logger.Error("Job processing failed", "job_id", jobIDStr, "error", err)
+		if jobCtx.Err() == context.DeadlineExceeded {
+			p.logger.Error("Job processing timeout exceeded", "job_id", jobIDStr, "timeout", p.jobTimeout)
+		} else {
+			p.logger.Error("Job processing failed", "job_id", jobIDStr, "error", err)
+		}
 		p.handleJobError(jobIDStr, err)
 		return
 	}
 
-	// Job completed successfully - atomically update from Processing to Done
+	// Step 7: Job completed successfully - atomically update from Processing to Done
 	updated, err = p.storage.UpdateStatusAtomic(p.ctx, jobID, job.StatusProcessing, job.StatusDone)
 	if err != nil {
 		p.logger.Error("Error atomically updating job status to Done", "job_id", jobIDStr, "error", err)
@@ -330,16 +367,10 @@ func (p *Pool) handleJobError(jobIDStr string, err error) {
 
 	// Check if job can be retried
 	if j.CanRetry() {
-		// Calculate exponential backoff delay: base * 2^retry_count
-		// Base delay: 1 second
+		// Calculate exponential backoff delay using pure function
 		baseDelay := 1 * time.Second
-		backoffDelay := baseDelay * time.Duration(1<<uint(j.RetryCount))
-		
-		// Cap maximum delay at 5 minutes to prevent excessive delays
 		maxDelay := 5 * time.Minute
-		if backoffDelay > maxDelay {
-			backoffDelay = maxDelay
-		}
+		backoffDelay := retry.CalculateBackoff(j.RetryCount, baseDelay, maxDelay)
 
 		p.logger.Info("Job failed, will retry",
 			"job_id", jobIDStr,

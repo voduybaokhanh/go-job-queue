@@ -13,8 +13,6 @@ const (
 	DefaultQueueKey = "jobqueue:jobs"
 	// DelayedQueueKey is the Redis key for the delayed job queue (sorted set)
 	DelayedQueueKey = "jobqueue:delayed"
-	// LockKeyPrefix is the prefix for lock keys
-	LockKeyPrefix = "jobqueue:lock:"
 )
 
 // RedisQueue implements the Queue interface using Redis
@@ -80,52 +78,6 @@ func (q *RedisQueue) Dequeue(ctx context.Context) (string, error) {
 	}
 
 	return jobID, nil
-}
-
-// AcquireLock attempts to acquire a distributed lock using SETNX with expiration
-// Returns true if lock was acquired, false if already locked
-func (q *RedisQueue) AcquireLock(ctx context.Context, jobID string, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-
-	lockKey := fmt.Sprintf("%s%s", LockKeyPrefix, jobID)
-
-	// Use SET with NX (only if not exists) and EX (expiration) for atomic operation
-	// This ensures only one worker can acquire the lock
-	ok, err := q.client.SetNX(ctx, lockKey, "1", ttl).Result()
-	if err != nil {
-		return false, fmt.Errorf("failed to acquire lock for job %s: %w", jobID, err)
-	}
-
-	return ok, nil
-}
-
-// ReleaseLock releases a distributed lock for a job using Lua script for atomicity
-// The Lua script ensures only the lock owner can release it
-func (q *RedisQueue) ReleaseLock(ctx context.Context, jobID string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	lockKey := fmt.Sprintf("%s%s", LockKeyPrefix, jobID)
-
-	// Lua script to atomically delete the lock key
-	// This ensures atomicity even if multiple operations are attempted
-	script := `
-		if redis.call("EXISTS", KEYS[1]) == 1 then
-			return redis.call("DEL", KEYS[1])
-		else
-			return 0
-		end
-	`
-
-	_, err := q.client.Eval(ctx, script, []string{lockKey}).Result()
-	if err != nil {
-		return fmt.Errorf("failed to release lock for job %s: %w", jobID, err)
-	}
-
-	return nil
 }
 
 // EnqueueDelayed adds a job ID to the delayed queue using Redis Sorted Set
